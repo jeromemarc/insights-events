@@ -1,0 +1,94 @@
+- hosts: localhost
+  gather_facts: no
+  vars:
+          hcc_client_id: xxxx
+          hcc_client_secret: xxxx
+          endpoint: xxxx
+          orgid: xxxx
+
+  tasks:
+  - name: Get service account token
+    ansible.builtin.uri:
+            url: "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            status_code: 200
+            return_content: true
+            headers:
+                Content-Type: "application/x-www-form-urlencoded"
+            body:
+                client_id: "{{ hcc_client_id }}"
+                client_secret: "{{ hcc_client_secret }}"
+                scope: "api.console"
+                grant_type: "client_credentials"
+    register: result
+        
+  - name: Get CVEs (paginated - get page count)
+    ansible.builtin.uri:
+            url: "https://console.redhat.com/api/vulnerability/v1/vulnerabilities/cves?page=1&page_size=100&sort=-public_date&advisory_available=true&affecting_host_type=rpmdnf%2Cedge"
+            method: GET
+            status_code: 200
+            return_content: true
+            headers:
+                    Accept: "application/json"
+                    Authorization: "Bearer {{ result.json.access_token }}"
+    register: cves_pagecount
+
+  - name: Check page count
+    set_fact:
+            pages: "{{ cves_pagecount.json.meta.pages }}"
+
+  - name: Get CVEs (paginated)
+    ansible.builtin.uri:
+            url: "https://console.redhat.com/api/vulnerability/v1/vulnerabilities/cves?page={{ item }}&page_size=100&sort=-public_date&advisory_available=true&affecting_host_type=rpmdnf%2Cedge"
+            method: GET
+            status_code: 200
+            return_content: true
+            headers:
+                    Accept: "application/json"
+                    Authorization: "Bearer {{ result.json.access_token }}"
+    register: cves
+    with_sequence: "start=1 end={{ pages }}"
+
+  - name: Get CVEs from JSON
+    set_fact:
+      list_cves: "{{ list_cves | default([]) + [{
+        'reported_cve': item.id | default(''),
+        'description': item.attributes.description | default(''),
+        'cvss_score': item.attributes.cvss3_score | default(''),
+        'impact': item.attributes.impact | default(''),
+        'known_exploit': item.attributes.known_exploit | default(''),
+        'has_rule': item.attributes.advisory_available | default(''),
+        'publish_date': item.attributes.public_date | default(''),
+        'systems_affected': item.attributes.systems_affected | default('') }] }}" 
+    loop: "{{ cves.results | map(attribute='json.data') | flatten }}"
+
+  - copy:
+        dest: "cves.csv"
+        content: "{{ list_cves }}"
+
+  - name: Iterate over each CVE
+    debug:
+            msg: "Processing {{ item.reported_cve }} with impact {{ item.impact }}"
+    loop: "{{ list_cves }}"
+
+  - name: Send Vulnerability events to endpoint
+    uri:
+        url: "{{ endpoint }}"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "org_id": "{{ orgid }}",
+            "timestamp": "{{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S') }}",
+            "application": "vulnerability",
+            "bundle": "rhel",
+            "event_type": "new-cve",
+            "context": {},
+            "events": [{"payload":{"reported_cve": "{{item.reported_cve}}", "cvss_score": "{{item.cvss_score}}", "impact": "{{item.impact}}", "known_exploit": "{{item.known_exploit}}", "has_rule": "{{item.has_rule}}", "publish_date": "{{item.publish_date}}", "systems_affected": "{{item.systems_affected}}"}}],
+            "source": {"application":{"display_name":"Vulnerability"},"bundle":{"display_name":"Red Hat Enterprise Linux"},"event_type":{"display_name":"New vulnerability"}}
+          }
+        body_format: json
+        return_content: yes
+    loop: "{{ list_cves }}"
